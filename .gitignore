@@ -1,0 +1,15 @@
+# cocoshell runtime state (lives in the install dir, not the repo — belt & suspenders)
+cwd
+pane-id
+pane.lock
+jobs/
+DISABLED
+_DISABLED
+*.out
+*.rc
+*.fifo
+
+# editor / OS
+*.swp
+*~
+.DS_Store

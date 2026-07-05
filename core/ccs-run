@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# ~/.claude/ccs/ccs-run
+# Route a command through a visible terminal pane and capture its output.
+#
+# The terminal backend is pluggable via $CCS_BACKEND (default: zellij). The driver
+# `driver-$CCS_BACKEND.sh` provides be_create / be_alive / be_send (+ be_observe for
+# phase 2). Everything else — capture, exit code, cwd, completion — is backend-agnostic
+# and file-based. Deliberately NO `set -u` (the harness snapshot references unbound vars).
+#
+# Usage:
+#   ccs-run --job <token>     # command text already in jobs/<token>.cmd  (hook path)
+#   ccs-run --exec '<cmd>'    # run a literal command                    (manual/testing)
+#   echo '<cmd>' | ccs-run    # command from stdin
+
+CCS_DIR="$HOME/.claude/ccs"
+JOBS="$CCS_DIR/jobs"; mkdir -p "$JOBS"
+TIMEOUT="${CCS_TIMEOUT:-600}"
+INIT_FILE="$CCS_DIR/pane-init.sh"
+PANE_FILE="$CCS_DIR/pane-id"
+CCS_BACKEND="${CCS_BACKEND:-zellij}"
+
+# ---- resolve command + token -------------------------------------------------
+tok=""; CMD=""
+case "$1" in
+  --job)  tok="$2" ;;
+  --exec) CMD="$2" ;;
+  "")     CMD="$(cat)" ;;
+  *)      CMD="$*" ;;
+esac
+if [ -z "$tok" ]; then
+  tok="J$$-$RANDOM"
+  printf '%s' "$CMD" > "$JOBS/$tok.cmd"
+fi
+cmdfile="$JOBS/$tok.cmd"
+[ -f "$cmdfile" ] || { printf 'ccs-run: missing command file for %s\n' "$tok" >&2; exit 2; }
+
+run_local() { source "$cmdfile"; exit $?; }   # fail-open fallback / "null" backend
+
+# ---- load the terminal backend driver (be_create / be_alive / be_send) -------
+DRIVER="$CCS_DIR/driver-$CCS_BACKEND.sh"
+[ -f "$DRIVER" ] && source "$DRIVER" || { printf 'ccs-run: no driver for backend %s\n' "$CCS_BACKEND" >&2; run_local; }
+
+# ---- pane management (backend-agnostic) --------------------------------------
+ensure_pane() {
+  local p=""
+  [ -f "$PANE_FILE" ] && p="$(cat "$PANE_FILE" 2>/dev/null)"
+  be_alive "$p" && { printf '%s' "$p"; return 0; }
+  p="$(be_create)"; [ -n "$p" ] || return 1
+  printf '%s' "$p" > "$PANE_FILE"
+  printf '%s' "$p"
+}
+
+[ -f "$CCS_DIR/cwd" ] || pwd > "$CCS_DIR/cwd"   # seed cwd on first use
+
+# ---- serialize: one shell -> one command at a time ---------------------------
+exec 9>"$CCS_DIR/pane.lock"
+flock -w "$TIMEOUT" 9 || run_local
+
+PID="$(ensure_pane)" || run_local
+[ -n "$PID" ] || run_local
+
+# ---- inject; the pane signals completion by writing the .rc file -------------
+rcfile="$JOBS/$tok.rc"; rm -f "$rcfile"
+be_send "$PID" "source $INIT_FILE; __ccs_exec $tok" || run_local
+
+seen=no; start=$SECONDS
+while :; do
+  [ -f "$rcfile" ] && { seen=yes; break; }                                    # command finished (rc written by EXIT trap)
+  (( SECONDS - start >= TIMEOUT )) && break
+  sleep "${CCS_POLL:-0.01}"                                                     # lightweight poll for the .rc file (tunable)
+done
+
+if [ "$seen" != yes ]; then
+  printf 'ccs-run: timed out after %ss waiting on pane %s\n' "$TIMEOUT" "$PID" >&2
+  exit 124
+fi
+
+# ---- clean capture from the files the pane wrote -----------------------------
+out="$(cat "$JOBS/$tok.out" 2>/dev/null)"
+rc="$(cat "$rcfile" 2>/dev/null)"
+printf '%s\n' "$out"
+rm -f "$JOBS/$tok.cmd" "$JOBS/$tok.out" "$JOBS/$tok.rc" "$JOBS/$tok.out.fifo"
+exit "${rc:-0}"
